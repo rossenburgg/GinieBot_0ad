@@ -19,7 +19,7 @@ from nltk.tokenize import sent_tokenize
 
 logging.basicConfig(level=logging.DEBUG)
 
-openai.api_key = "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"
+openai.api_key = "sk-"
 
 
 class CommandBot(sleekxmpp.ClientXMPP):
