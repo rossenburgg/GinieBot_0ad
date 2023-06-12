@@ -5,6 +5,9 @@ import re
 import ssl
 import time
 import uuid
+import matplotlib.pyplot as plt
+from collections import deque
+from selenium.webdriver.support.wait import WebDriverWait
 from twilio.rest import Client
 import requests
 import sleekxmpp
@@ -13,13 +16,39 @@ import nltk
 from nltk.stem import SnowballStemmer
 import openai
 import threading
+from sleekxmpp import Message
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium import webdriver
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+from flask import Flask, render_template
+
 
 nltk.download("punkt")
 from nltk.tokenize import sent_tokenize
+app = Flask(__name__)
+
 
 logging.basicConfig(level=logging.DEBUG)
 
-openai.api_key = "sk-"
+
+
+# The name of the MUC room to monitor
+MUC_ROOM = 'arena26@conference.lobby.wildfiregames.com'
+
+
+def detect_spam(msg):
+    # Use a regular expression to match messages that contain a word repeated more than 3 times, even if the word is split into multiple messages
+    words = msg.split()
+    for word in words:
+        if words.count(word) > 5:
+            return True
+    return False
 
 
 class CommandBot(sleekxmpp.ClientXMPP):
@@ -31,7 +60,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
             nick,
             default_target_room="e@conference.lobby.wildfiregames.com",
             spam_reports="s@conference.lobby.wildfiregames.com",
-            arena25="arena16@conference.lobby.wildfiregames.com",
+            arena25="arena15@conference.lobby.wildfiregames.com",
+            arena27="arena14@conference.lobby.wildfiregames.com"
 
     ):
         sleekxmpp.ClientXMPP.__init__(self, jid, password)
@@ -45,6 +75,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.default_target_room = default_target_room
         self.spam_reports = spam_reports
         self.arena25 = arena25
+        self.arena27 = arena27
         self.rooms = [
             room
         ]  # Initialize the list of rooms to include the room the bot was originally added to
@@ -63,6 +94,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.add_event_handler("message", self.handle_reports)
         self.add_event_handler("message", self.handle_mail)
         self.add_event_handler("message", self.handle_mute)
+        self.add_event_handler("message", self.handle_private_message)
 
         # mention bot attr
         self.mention_limit_notified = set()
@@ -85,6 +117,19 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.users_to_watch = []
         self.first_report = True
         self.muted_users = {}
+        self.last_seen = {}
+        self.last_warnings = {}
+        self.COOLDOWN_TIME_MINUTES = 20
+        self.message_count = 0
+        self.message_counts_history = []
+        self.users_online = 0
+        self.users_online_history = []
+        self.users_joined_history = []
+        self.users_left_history = []
+        self.users_joined = 0
+        self.users_left = 0
+        self.reports = 0
+        self.reports_history = []
 
     def command_match(self, msg):
 
@@ -99,13 +144,16 @@ class CommandBot(sleekxmpp.ClientXMPP):
 
     def start(self, event):
         self.get_roster()
-        self.send_presence(pshow='Away')
+        self.send_presence()
+        self.send_presence(pshow="away")
+        self.send_presence_subscription(pto="moderation-bot@lobby.wildfiregames.com")
         self.plugin["xep_0045"].joinMUC(self.room, self.nick, wait=True)
         self.plugin["xep_0045"].joinMUC(self.spam_reports, self.nick, wait=True)
         self.plugin["xep_0045"].joinMUC(self.arena25, self.nick, wait=True)
+        self.plugin["xep_0045"].joinMUC(self.arena27, self.nick, wait=True)
 
         # Join the rooms
-        for r in [self.room, self.spam_reports, self.arena25]:
+        for r in [self.room, self.spam_reports, self.arena25, self.arena27]:
             self.plugin["xep_0045"].joinMUC(r, self.nick, wait=True)
             self.send_presence(pshow='away', pstatus="Undergoing realtime update", pto=r)
             # Print the watch list
@@ -114,7 +162,9 @@ class CommandBot(sleekxmpp.ClientXMPP):
         # Send a broadcast message to the spam_reports room about the new update
         # Also add users who will later join the room to a list so they can be messaged privately
         changelog = [
-            "Fixed valid_units years:years",
+            "Added new command push-analytics (uses selenium to crawl on forums)",
+            "Fixed mute duration unit err_ for hours",
+            "Bot now pings when sending reminders"
 
         ]
 
@@ -127,6 +177,21 @@ class CommandBot(sleekxmpp.ClientXMPP):
             mbody=message_body,
             mtype="groupchat",
         )
+
+    def handle_roster_update(self, roster):
+        for jid in roster["roster"]:
+            if jid.bare == "moderation-bot@lobby.wildfiregames.com":
+                subscription = roster["roster"][jid]["subscription"]
+                if subscription == "both":
+                    print("Bot is subscribed to moderation-bot JID")
+                elif subscription == "none":
+                    print("Bot is not subscribed to moderation-bot JID")
+                elif subscription == "from":
+                    print("Bot has received a subscription request from moderation-bot JID")
+                elif subscription == "to":
+                    print("Bot has sent a subscription request to moderation-bot JID")
+                elif subscription == "remove":
+                    print("Bot has been removed from moderation-bot JID's roster")
 
     def invite(self, pres):
         # When a user is invited to the spam_reports room, add them to the new_update_users list
@@ -225,7 +290,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     f"{bot_name} commands: display all available commands",
                     f"{bot_name} offenders: display the number of offenders",
                     f"{bot_name} filereport username: File a report for a player",
-                    f"{bot_name} listreports : Show all reports"
+                    f"{bot_name} listreports : Show all reports",
+                    f"{bot_name} push-analytics : Publish moderation report to the wildfiregames forums (Use only at the beginning of every month)"
                 ]
                 message = f"Available commands: \n" + '\n'.join(commands)
                 self.send_message(mto=self.spam_reports, mbody=message, mtype='groupchat')
@@ -243,14 +309,6 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 message = f"{user_nickname} has left {self.default_target_room}."
                 self.send_message(mto=self.spam_reports, mbody=message, mtype='groupchat')
                 del self.users_announced[user_nickname]
-
-    def detect_spam(self, msg):
-        # Use a regular expression to match messages that contain a word repeated more than 3 times, even if the word is split into multiple messages
-        words = msg.split()
-        for word in words:
-            if words.count(word) > 5:
-                return True
-        return False
 
     def generate_response(self, prompt, msg):
         try:
@@ -409,7 +467,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 body = msg["body"].strip()
 
                 # Check if the command is "!sendmail"
-                if body.lower() == f"{self.nick.lower()} sendmail":
+                if body.lower() == f"{self.nick.lower()} zeroday":
                     # Send SMS using Twilio
                     account_sid = 'AC0a952b277af3311c86ca8a9ba3bc6233'
                     auth_token = '5b90ea5c29bfffcc1882d17e3d3804ef'
@@ -426,14 +484,14 @@ class CommandBot(sleekxmpp.ClientXMPP):
                         print(f'SMS sent successfully. Message SID: {message.sid}')
                         self.send_message(
                             mto=self.spam_reports,
-                            mbody="Success: SMS sent successfully",
+                            mbody="Success: Packet sent successfully",
                             mtype="groupchat",
                         )
                     except Exception as e:
                         print(f'Error sending SMS: {e}')
                         self.send_message(
                             mto=self.spam_reports,
-                            mbody="Error: Failed to send SMS",
+                            mbody="Error: Failed to send packets",
                             mtype="groupchat",
                         )
 
@@ -464,6 +522,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
 
             # Check if the command is "!mute"
             if "!mute" in body.lower():
+
                 # Extract the mute parameters from the message body
                 mute_params = body.split()[1:]  # Exclude "!mute"
                 if len(mute_params) >= 2:
@@ -481,15 +540,19 @@ class CommandBot(sleekxmpp.ClientXMPP):
                             raise ValueError("Invalid mute duration format.")
                         valid_units = {"m": "minutes", "min": "minutes", "mins": "minutes", "minute": "minutes",
                                        "minutes": "minutes",
-                                       "h": "hours", "hr": "hours", "hrs": "hours",
+                                       "h": "hours", "hr": "hours", "hrs": "hours", "hour": "hours", "hours": "hours",
                                        "d": "days", "day": "days", "days": "days",
                                        "y": "years", "yr": "years", "yrs": "years", "year": "years", "years": "years"}
-                        if duration_unit not in valid_units:
+                        try:
+                            duration_unit = valid_units[duration_unit]
+                        except KeyError:
                             self.send_message(
                                 mto=self.spam_reports,
-                                mbody=f"Invalid mute duration unit.",
+                                mbody=f"Invalid mute duration unit or arguments.",
                                 mtype="groupchat",
                             )
+                            return
+
                         duration_unit = valid_units[duration_unit]
                         if len(mute_params) > 2 and mute_params[2] == "-r":
                             reason = " ".join(mute_params[3:])
@@ -515,7 +578,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                                 # Send unmute confirmation message
                                 self.send_message(
                                     mto=self.spam_reports,
-                                    mbody=f"Reminder: Mute duration for '{name}' is over! {duration_value} {duration_unit} ({duration_in_seconds} seconds).",
+                                    mbody=f"Reminder: Hi'{msg['mucnick']}', Mute duration for '{name}' is over! {duration_value} {duration_unit} ({duration_in_seconds} seconds).",
                                     mtype="groupchat",
                                 )
 
@@ -538,11 +601,229 @@ class CommandBot(sleekxmpp.ClientXMPP):
                             mtype="groupchat",
                         )
 
+    def handle_private_message(self, msg):
+        # Check if the message is a private message and is from the other bot jid
+        if msg["type"] == "chat" and msg["from"].bare == "moderation-bot@lobby.wildfiregames.com":
+            # Parse the message to see if the kick was successful or failed
+            if "success" in msg["body"]:
+                response = f"Response from ModerationBot: The kick was successful."
+            else:
+                response = f"Response from ModerationBot: The kick failed."
+
+            # Send the response to the groupchat
+            self.send_message(
+                mto=self.spam_reports,
+                mbody=response,
+                mtype="groupchat",
+            )
+
+    def post_to_forum(self, msg_text):
+        options = Options()
+        # options.add_argument("--headless")
+        options.add_argument("--no-sandbox")  # Add the --no-sandbox flag
+
+        driver = webdriver.Chrome(options=options)
+        driver.get("https://wildfiregames.com/forum/login/")
+
+        # find the username, password fields, and submit button
+        username = driver.find_element(By.NAME, "auth")
+        password = driver.find_element(By.NAME, "password")
+        submit_button = driver.find_element(By.NAME, "_processLogin")
+
+        # fill out the form and submit it
+        username.send_keys("geniebot@megatsuhinokami.com")
+        password.send_keys("Rossenburg909090@@@")
+        submit_button.click()
+
+        # check if login is successful
+        try:
+            # find a unique element that only appears after login
+            logout_button = driver.find_element(By.CLASS_NAME, "ipsMenu_item")
+            print("Forums Login successful!")
+            self.send_message(
+                mto=self.spam_reports,
+                mbody="Forums Login successful, navigating to thread...",
+                mtype="groupchat",
+            )
+        except:
+            print("Forums Login failed!")
+            self.send_message(
+                mto=self.spam_reports,
+                mbody="Forums Login failed!",
+                mtype="groupchat",
+            )
+            driver.close()
+            return
+
+        # now you should be logged in, navigate to the specific thread
+        driver.get("https://wildfiregames.com/forum/topic/107455-improving-the-ai/")
+
+        # wait until the reply area is clickable and click it
+        reply_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, '.ipsComposeArea_dummy')))
+        reply_button.click()
+
+        # wait until the text area appears and then input the text
+        reply_box = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, '.cke_wysiwyg_div')))
+        msg_text = "Moderation Analysis"
+        reply_box.send_keys(msg_text)
+
+        # wait for a few seconds to ensure the message is entered
+        time.sleep(3)
+
+        # find the submit button using an alternative locator
+        reply_submit_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "Submit")]')))
+        reply_submit_button.click()
+
+        # wait for a few seconds to allow the message to be submitted
+        time.sleep(3)
+
+        # check if the message is successfully submitted
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '.ipsMessage')))
+            print("Moderation report submitted successfully!")
+            self.send_message(
+                mto=self.spam_reports,
+                mbody="All set! Moderation report submitted successfully, you can review it on the forums!",
+                mtype="groupchat",
+            )
+        except:
+            print("Forum Post submission failed!")
+            self.send_message(
+                mto=self.spam_reports,
+                mbody="All set! Moderation report submitted successfully, you can review it on the forums!",
+                mtype="groupchat",
+            )
+
+        driver.close()
+
+    def process_message(self, msg):
+        if msg['type'] == 'groupchat' and msg['mucroom'] == self.default_target_room:
+            self.users_joined += 1
+            self.users_joined_history.append(self.users_joined)
+        elif msg['type'] == 'unavailable' and msg['mucroom'] == self.default_target_room:
+            self.users_left += 1
+            self.users_left_history.append(self.users_left)
+
+        if msg['mucroom'] == self.spam_reports and msg['mucnick'] == self.nick:
+            self.reports += 1
+            self.reports_history.append(self.reports)
+        else:
+            self.reports_history.append(self.reports)
+
+        # Additional statistics
+        self.users_online_history.append(self.get_users_online())
+        self.message_counts_history.append(self.message_count)
+
+        self.update_chart()
+
+    def get_users_online(self):
+        roster = self.plugin["xep_0045"].getRoster(self.default_target_room)
+        if roster is not None:
+            return len(roster)
+        return 0
+
+    def update_chart(self):
+        self.message_count = len(self.message_counts_history)
+        self.users_online = self.users_online_history[-1] if self.users_online_history else 0
+
+        fig = make_subplots(rows=2, cols=2,
+                            subplot_titles=("Message Count", "Users Online", "Users Joined", "Users Left"))
+
+        # Message Count (Line Chart)
+        fig.add_trace(
+            go.Scatter(x=list(range(len(self.message_counts_history))), y=self.message_counts_history, mode='lines',
+                       name='Message Count'),
+            row=1, col=1
+        )
+
+        # Message Count (Bar Chart)
+        fig.add_trace(
+            go.Bar(x=list(range(len(self.message_counts_history))), y=self.message_counts_history,
+                   name='Message Count'),
+            row=1, col=1
+        )
+
+        # Users Online (Line Chart)
+        fig.add_trace(
+            go.Scatter(x=list(range(len(self.users_online_history))), y=self.users_online_history, mode='lines',
+                       name='Users Online'),
+            row=1, col=2
+        )
+
+        # Users Online (Bar Chart)
+        fig.add_trace(
+            go.Bar(x=list(range(len(self.users_online_history))), y=self.users_online_history,
+                   name='Users Online'),
+            row=1, col=2
+        )
+
+        # Users Joined
+        fig.add_trace(
+            go.Scatter(x=list(range(len(self.users_joined_history))), y=self.users_joined_history, mode='lines',
+                       name='Users Joined'),
+            row=2, col=1
+        )
+
+        # Users Left
+        fig.add_trace(
+            go.Scatter(x=list(range(len(self.users_left_history))), y=self.users_left_history, mode='lines',
+                       name='Users Left'),
+            row=2, col=2
+        )
+
+        # Reports Count
+        fig.add_trace(
+            go.Scatter(x=list(range(len(self.reports_history))), y=self.reports_history, mode='lines',
+                       name='Reports Count'),
+            row=2, col=2
+        )
+
+        fig.update_layout(height=600, width=1000, title_text="MUC Room Statistics")
+
+        # Add total users online, message count, and reports count annotations
+        fig.add_annotation(xref="paper", yref="paper", x=0.5, y=1.1,
+                           text=f"Total Users Online: {self.users_online}",
+                           showarrow=False, font=dict(size=14))
+
+        fig.add_annotation(xref="paper", yref="paper", x=0.5, y=-0.15,
+                           text=f"Total Message Count: {self.message_count}",
+                           showarrow=False, font=dict(size=14))
+
+        fig.add_annotation(xref="paper", yref="paper", x=1, y=0,
+                           text=f"Reports Count: {self.reports}",
+                           showarrow=False, font=dict(size=14))
+
+        # Save the chart as an HTML file
+        fig.write_html("static/statistics.html")
+
     def message(self, msg):
 
         # Check if the message is from the bot itself
         if msg["mucnick"] == self.nick:
             return
+
+        self.process_message(msg)
+
+
+        if msg["type"] == "groupchat" and msg["mucroom"] == self.spam_reports:
+            body = msg["body"].strip()
+
+            if msg[
+                "body"].lower().startswith(self.nick.lower() + " push-analytics"):
+                # Extract the message to be posted from the command
+                msg_text = body[len("!post"):].strip()
+                self.send_message(
+                    mto=self.spam_reports,
+                    mbody="Initializing login request, please wait...",
+                    mtype="groupchat",
+                )
+
+                # Post the message to the forum
+                self.post_to_forum(msg_text)
 
         if msg["mucroom"] == self.spam_reports and msg["type"] in ("groupchat", "normal") and msg[
             "body"].lower().startswith(self.nick.lower() + " listreports"):
@@ -665,7 +946,9 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 if msg["mucroom"] == self.spam_reports and msg["mucnick"] != self.nick and msg[
                     "from"].bare in self.new_update_users:
                     changelog = [
-                        "Fixed valid_units years:years",
+                        "Added new command push-analytics (uses selenium to crawl on forums)",
+                        "Fixed mute duration unit err_ for hours",
+                        "Bot now pings when sending reminders"
 
                     ]
 
@@ -907,22 +1190,35 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 user_offenses["total_offenses"] = total_offenses
                 user_offenses["rank"] = "Pejorative"
                 self.user_offenses[sender_nick] = user_offenses
-                warning_messages = {
-                    "en": f"Please do not use '{offensive_word}' in the chat room. Reported to lobby moderators.",
-                    "es": f"Por favor, no uses '{offensive_word}' en la sala de chat. Reportado a los moderadores del lobby.",
-                    "pt": f"Por favor, não use '{offensive_word}' na sala de bate-papo. Reportado aos moderadores do lobby.",
-                    "fr": f"Veuillez ne pas utiliser '{offensive_word}' dans la salle de discussion. Signalé aux modérateurs du lobby.",
-                    "ru": f"Пожалуйста, не используйте '{offensive_word}' в чате. Сообщено модераторам лобби.",
-                    "pl": f"Nie używaj słowa '{offensive_word}' na czacie. Zgłoszone do moderatorów lobby.",
-                }
 
-                warning_message = warning_messages[detected_language].format(offensive_word=offensive_word)
+                # Check if the user has been warned within the cooldown period
+                last_warning_time = self.last_warnings.get(sender_nick)
+                if last_warning_time and (now - last_warning_time) < datetime.timedelta(
+                        minutes=self.COOLDOWN_TIME_MINUTES):
+                    # User has been warned recently, don't warn again
+                    report_offense = False
+                else:
+                    # User has not been warned recently, send warning message
+                    report_offense = True
+                    warning_messages = {
+                        "en": f"Please do not use '{offensive_word}' in the chat room. Reported to lobby moderators.",
+                        "es": f"Por favor, no uses '{offensive_word}' en la sala de chat. Reportado a los moderadores del lobby.",
+                        "pt": f"Por favor, não use '{offensive_word}' na sala de bate-papo. Reportado aos moderadores do lobby.",
+                        "fr": f"Veuillez ne pas utiliser '{offensive_word}' dans la salle de discussion. Signalé aux modérateurs du lobby.",
+                        "ru": f"Пожалуйста, не используйте '{offensive_word}' в чате. Сообщено модераторам лобби.",
+                        "pl": f"Nie używaj słowa '{offensive_word}' na czacie. Zgłoszone do moderatorów lobby.",
+                    }
 
-                self.send_message(
-                    mto=msg["from"].bare,
-                    mbody=warning_message,
-                    mtype="groupchat",
-                )
+                    warning_message = warning_messages[detected_language].format(offensive_word=offensive_word)
+
+                    self.send_message(
+                        mto=msg["from"].bare,
+                        mbody=warning_message,
+                        mtype="groupchat",
+                    )
+
+                    # Record the time of the warning
+                    self.last_warnings[sender_nick] = now
 
                 # Report the offense to the spam_reports group
                 user_total_offenses = self.get_user_total_offenses(sender_nick)
@@ -934,8 +1230,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     "ru": "Russian",
                     "pt": "Portuguese",
                     "pl": "Polish"
-
                 }
+
                 # Get the name of the detected language from the language_names dictionary
                 detected_language_name = language_names.get(detected_language, detected_language)
 
@@ -945,7 +1241,6 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     mbody=report_message,
                     mtype="groupchat",
                 )
-                return
 
             # Check if the message contains any of the additional words to mask
             additional_words = [
@@ -963,7 +1258,6 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 "faggots",
                 "faggotty",
                 "faggoty",
-                "sh*",
                 "sh*t",
                 "FUCK"
             ]
@@ -993,6 +1287,12 @@ class CommandBot(sleekxmpp.ClientXMPP):
                             mbody=f"\U0001F575 Profane Report: {sender_nick} used '{word}' in the lobby. \n\U0001F4AC Message: {msg['body']}. \n\U0001F501 Repeated offense: {total_offenses} times within the last 14 days. \n\U0001F947 Rank: Profanity",
                             mtype="groupchat",
                         )
+                        self.send_message(
+                            mto=self.spam_reports,
+                            mbody=f"!kick {sender_nick} please refrain from using offensive languages.",
+                            mtype="groupchat",
+                        )
+
                     return
 
         # Extract the user's JID from the message
@@ -1014,14 +1314,16 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 prompt = msg["body"].replace(f"{self.nick}", "").strip()
 
                 # Check if the bot has reached its response limit, and if so, set a cooldown period
-                if self.response_count >= 12:
+                if self.response_count >= 10:
                     print("Reached response limit, setting cooldown")
                     self.response_count = 0
                     self.response_cooldown_start_time = time.time()
                     sender_nick = msg["mucnick"]
                     self.send_message(
                         mto=msg["from"].bare,
-                        mbody=f"I'm now on a cooldown mode {sender_nick}. We can continue after 1hour. For now, enjoy 0.A.D!",
+                        # mbody=f"I'm now on a cooldown mode {sender_nick}. We can continue after 1hour. For now, enjoy 0.A.D!",
+                        mbody=f"Notice: I'm now on a cooldown mode {sender_nick}. We can continue after 1hour. For now, enjoy 0.A.D!",
+
                         mtype="groupchat",
                     )
                     return
@@ -1095,18 +1397,20 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     mtype="groupchat",
                 )
 
+        self.update_chart()
+
     # This method is called to join a chat room
     def join_room(self, room_jid):
-        self.plugin["xep_0045"].joinMUC(room_jid, self.nick, wait=True)
+        self.plugin["xep_0045"].joinMUC(room_jid, self.nick, wait=True, )
         self.rooms.append(room_jid)
 
 
 if __name__ == "__main__":
     xmpp = CommandBot(
-        "geniebot@lobby.wildfiregames.com",
-        "F67661357F76509D3EF91EB30F204142316F2AD4FF32084AC3B646722CEEA2C9",
-        "e@conference.lobby.wildfiregames.com",
-        "[GenieBot]",
+        "",
+        "",
+        "",
+        "GenieBot",
     )
     xmpp.register_plugin("xep_0030")  # Service Discovery
     xmpp.register_plugin("xep_0045")  # Multi-User Chat
