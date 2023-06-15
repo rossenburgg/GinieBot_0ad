@@ -24,18 +24,16 @@ from selenium.webdriver.chrome.options import Options
 from selenium import webdriver
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
+from collections import defaultdict, deque
 
 from flask import Flask, render_template
 
-
 nltk.download("punkt")
 from nltk.tokenize import sent_tokenize
+
 app = Flask(__name__)
 
-
 logging.basicConfig(level=logging.DEBUG)
-
 
 
 # The name of the MUC room to monitor
@@ -60,8 +58,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
             nick,
             default_target_room="e@conference.lobby.wildfiregames.com",
             spam_reports="s@conference.lobby.wildfiregames.com",
-            arena25="arena15@conference.lobby.wildfiregames.com",
-            arena27="arena14@conference.lobby.wildfiregames.com"
+            arena25="arena21@conference.lobby.wildfiregames.com",
+            arena27="arena22@conference.lobby.wildfiregames.com"
 
     ):
         sleekxmpp.ClientXMPP.__init__(self, jid, password)
@@ -92,9 +90,13 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.add_event_handler('presence', self.on_presence)
         self.add_event_handler("message", self.list_commands)
         self.add_event_handler("message", self.handle_reports)
-        self.add_event_handler("message", self.handle_mail)
+        # self.add_event_handler("message", self.handle_mail)
         self.add_event_handler("message", self.handle_mute)
         self.add_event_handler("message", self.handle_private_message)
+        self.last_msgs = defaultdict(lambda: deque(maxlen=3))
+        self.quiet_end = 0  # the time at which the bot will stop being quiet
+        threading.Thread(target=self.check_quiet_period).start()
+        self.spam_detected = {}
 
         # mention bot attr
         self.mention_limit_notified = set()
@@ -162,9 +164,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
         # Send a broadcast message to the spam_reports room about the new update
         # Also add users who will later join the room to a list so they can be messaged privately
         changelog = [
-            "Added new command push-analytics (uses selenium to crawl on forums)",
-            "Fixed mute duration unit err_ for hours",
-            "Bot now pings when sending reminders"
+            "Added `spam_detected` dictionary to keep track of whether spam has been detected for a specific message from a particular sender.",
 
         ]
 
@@ -291,7 +291,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     f"{bot_name} offenders: display the number of offenders",
                     f"{bot_name} filereport username: File a report for a player",
                     f"{bot_name} listreports : Show all reports",
-                    f"{bot_name} push-analytics : Publish moderation report to the wildfiregames forums (Use only at the beginning of every month)"
+                    f"{bot_name} push-analytics : Publish moderation report to the wildfiregames forums (Use only at the beginning of every month)",
+                    f"{bot_name} zeroday time-in-secs (eg. zeroday 60) : Force set bot to ignore all messages for a specific period without having to actually mute it)"
                 ]
                 message = f"Available commands: \n" + '\n'.join(commands)
                 self.send_message(mto=self.spam_reports, mbody=message, mtype='groupchat')
@@ -455,45 +456,45 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     mtype="groupchat",
                 )
 
-    def handle_mail(self, msg):
-        if msg["type"] in ("groupchat", "chat"):
-            if msg["type"] == "groupchat" and msg["mucroom"] == self.spam_reports:
-                # Check if the sender is allowed to use the command
-                sender_nick = msg["mucnick"].lower()
-                if sender_nick not in [nick.lower() for nick in self.allowed_nicks]:
-                    return
-
-                # Extract the username from the message body
-                body = msg["body"].strip()
-
-                # Check if the command is "!sendmail"
-                if body.lower() == f"{self.nick.lower()} zeroday":
-                    # Send SMS using Twilio
-                    account_sid = 'AC0a952b277af3311c86ca8a9ba3bc6233'
-                    auth_token = '5b90ea5c29bfffcc1882d17e3d3804ef'
-                    from_phone_number = '+15075744220'  # Your Twilio phone number
-                    to_phone_number = '+12052910550'  # Recipient's phone number
-                    client = Client(account_sid, auth_token)
-
-                    try:
-                        message = client.messages.create(
-                            body='This is a test SMS message from GenieBot Xmpp Server',  # SMS body
-                            from_=from_phone_number,  # Your Twilio phone number
-                            to=to_phone_number  # Recipient's phone number
-                        )
-                        print(f'SMS sent successfully. Message SID: {message.sid}')
-                        self.send_message(
-                            mto=self.spam_reports,
-                            mbody="Success: Packet sent successfully",
-                            mtype="groupchat",
-                        )
-                    except Exception as e:
-                        print(f'Error sending SMS: {e}')
-                        self.send_message(
-                            mto=self.spam_reports,
-                            mbody="Error: Failed to send packets",
-                            mtype="groupchat",
-                        )
+    # def handle_mail(self, msg):
+    #     if msg["type"] in ("groupchat", "chat"):
+    #         if msg["type"] == "groupchat" and msg["mucroom"] == self.spam_reports:
+    #             # Check if the sender is allowed to use the command
+    #             sender_nick = msg["mucnick"].lower()
+    #             if sender_nick not in [nick.lower() for nick in self.allowed_nicks]:
+    #                 return
+    #
+    #             # Extract the username from the message body
+    #             body = msg["body"].strip()
+    #
+    #             # Check if the command is "!sendmail"
+    #             if body.lower() == f"{self.nick.lower()} zeroday":
+    #                 # Send SMS using Twilio
+    #                 account_sid = 'AC0a952b277af3311c86ca8a9ba3bc6233'
+    #                 auth_token = '5b90ea5c29bfffcc1882d17e3d3804ef'
+    #                 from_phone_number = '+15075744220'  # Your Twilio phone number
+    #                 to_phone_number = '+12052910550'  # Recipient's phone number
+    #                 client = Client(account_sid, auth_token)
+    #
+    #                 try:
+    #                     message = client.messages.create(
+    #                         body='This is a test SMS message from GenieBot Xmpp Server',  # SMS body
+    #                         from_=from_phone_number,  # Your Twilio phone number
+    #                         to=to_phone_number  # Recipient's phone number
+    #                     )
+    #                     print(f'SMS sent successfully. Message SID: {message.sid}')
+    #                     self.send_message(
+    #                         mto=self.spam_reports,
+    #                         mbody="Success: Packet sent successfully",
+    #                         mtype="groupchat",
+    #                     )
+    #                 except Exception as e:
+    #                     print(f'Error sending SMS: {e}')
+    #                     self.send_message(
+    #                         mto=self.spam_reports,
+    #                         mbody="Error: Failed to send packets",
+    #                         mtype="groupchat",
+    #                     )
 
     def get_duration_in_seconds(self, value, unit):
         """
@@ -631,8 +632,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
         submit_button = driver.find_element(By.NAME, "_processLogin")
 
         # fill out the form and submit it
-        username.send_keys("geniebot@megatsuhinokami.com")
-        password.send_keys("Rossenburg909090@@@")
+        username.send_keys("")
+        password.send_keys("")
         submit_button.click()
 
         # check if login is successful
@@ -800,14 +801,67 @@ class CommandBot(sleekxmpp.ClientXMPP):
         # Save the chart as an HTML file
         fig.write_html("static/statistics.html")
 
+    def check_quiet_period(self):
+        while True:
+            if self.quiet_end and time.time() > self.quiet_end:
+                self.quiet_end = None  # Reset the quiet end time so we don't send the message multiple times
+                self.send_message(
+                    mto=self.spam_reports,
+                    mbody="Quiet mode has ended, I will now respond to messages in " + self.default_target_room + ".",
+                    mtype="groupchat",
+                )
+            time.sleep(1)  # Check again in one second
+
     def message(self, msg):
 
         # Check if the message is from the bot itself
         if msg["mucnick"] == self.nick:
             return
 
-        self.process_message(msg)
+        if msg['mucnick'] != self.nick:
+            sender = msg['mucnick']
+            content = msg['body']
+            self.last_msgs[sender].append({'content': content, 'time': time.time()})
 
+            if len(self.last_msgs[sender]) >= 2:
+                # check if the last three messages from this sender are the same and within 30 seconds
+                if all(m['content'] == content and time.time() - m['time'] < 30 for m in self.last_msgs[sender]):
+                    if not self.spam_detected.get(sender + content,
+                                                  False):  # check if a spam alert has already been sent for this message from this sender
+                        print(f"Spam detected from {sender} in room {self.room}: {content}")
+                        self.send_message(
+                            mto=self.spam_reports,
+                            mbody=f"Spam detected from '{sender}' in room '{self.room}'",
+                            mtype="groupchat",
+                        )
+                        self.spam_detected[
+                            sender + content] = True  # mark that a spam alert has been sent for this message from this sender
+                else:
+                    self.spam_detected[
+                        sender + content] = False  # if the messages are not the same, reset the spam_detected flag
+        if msg['mucnick'] != self.nick:
+            if self.quiet_end and time.time() < self.quiet_end and msg['from'].bare == self.default_target_room:
+                # if the bot is in quiet mode and the message is from the target room, don't process the message
+                return
+
+            content = msg['body']
+
+            if msg['from'].bare == self.spam_reports:  # Check if the message is from the specific room
+                if content.lower().startswith(self.nick.lower() + " zeroday"):
+                    try:
+                        quiet_seconds = int(content.split()[2])
+                        self.quiet_end = time.time() + quiet_seconds
+                        self.send_message(
+                            mto=self.spam_reports,
+                            mbody="Zer0Day Initialized. I won't respond to messages in " + self.default_target_room + " for " + str(
+                                quiet_seconds) + " seconds.",
+                            mtype="groupchat",
+                        )
+                    except ValueError:
+                        # if the second part of the message after "quietmode" isn't an integer, ignore the command
+                        pass
+
+        self.process_message(msg)
 
         if msg["type"] == "groupchat" and msg["mucroom"] == self.spam_reports:
             body = msg["body"].strip()
@@ -946,9 +1000,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 if msg["mucroom"] == self.spam_reports and msg["mucnick"] != self.nick and msg[
                     "from"].bare in self.new_update_users:
                     changelog = [
-                        "Added new command push-analytics (uses selenium to crawl on forums)",
-                        "Fixed mute duration unit err_ for hours",
-                        "Bot now pings when sending reminders"
+                        "Added `spam_detected` dictionary to keep track of whether spam has been detected for a specific message from a particular sender.",
+
 
                     ]
 
@@ -1410,7 +1463,7 @@ if __name__ == "__main__":
         "",
         "",
         "",
-        "GenieBot",
+        "",
     )
     xmpp.register_plugin("xep_0030")  # Service Discovery
     xmpp.register_plugin("xep_0045")  # Multi-User Chat
