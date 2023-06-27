@@ -56,15 +56,14 @@ class CommandBot(sleekxmpp.ClientXMPP):
             password,
             room,
             nick,
-            default_target_room="e@conference.lobby.wildfiregames.com",
-            spam_reports="s@conference.lobby.wildfiregames.com",
-            arena25="arena21@conference.lobby.wildfiregames.com",
-            arena27="arena22@conference.lobby.wildfiregames.com"
+            default_target_room="arena26@conference.lobby.wildfiregames.com",
+            spam_reports="",
+            arena25="arena25@conference.lobby.wildfiregames.com",
+            arena27="arena27@conference.lobby.wildfiregames.com"
 
     ):
         sleekxmpp.ClientXMPP.__init__(self, jid, password)
 
-        self.reports = {}
         self.users_announced = {}
         self.offenders = {}
         self.room = room
@@ -102,7 +101,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.mention_limit_notified = set()
         self.users_at_mention_limit = set()
         # Initialize the list of users who are allowed to see the list of commands
-        self.allowed_nicks = ["defc0n", "~Defc0n", "user1", "Norse_Harold", "Dunedan"]
+        self.allowed_nicks = ["defc0n", "~Defc0n", "user1", "Norse_Harold", "Dunedan", "Ratings", "ModerationBot"]
+        self.bot_nicks = ["Ratings", "ModerationBot"]
 
         # Initialize the user cooldown dictionary
         self.wikipedia_user_cooldowns = {}
@@ -132,6 +132,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.users_left = 0
         self.reports = 0
         self.reports_history = []
+        self.reportsHelper = {}
 
     def command_match(self, msg):
 
@@ -164,7 +165,12 @@ class CommandBot(sleekxmpp.ClientXMPP):
         # Send a broadcast message to the spam_reports room about the new update
         # Also add users who will later join the room to a list so they can be messaged privately
         changelog = [
-            "Added `spam_detected` dictionary to keep track of whether spam has been detected for a specific message from a particular sender.",
+            "Minor changes",
+            "добавил больше ненормативной лексики",
+            "Fixed zeroday affecting all commands",
+            "Separated dicts and removed auto actions since Moderation bot is back on track.",
+            "Filereports should work now!",
+            "Add user nick to warnings"
 
         ]
 
@@ -439,7 +445,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 real_url = f"https://wildfiregames.com/forum/topic/67875-ratings-disputes-and-offence-reporting/"
                 link = short_url
                 # Store the report and its ID in the reports dictionary
-                self.reports[report_id] = {"username": username, "sender": sender_nick}
+                self.reportsHelper[report_id] = {"username": username, "sender": sender_nick}
                 # Send the message with the link and reference ID
                 output = f"Hi {username}, I apologize for the inconvenience caused by the player who left a 1v1 game without resigning. To address this issue, please report the incident and tag user1 using the reference ID below at:\n{link}\n\n"
                 output += "{:<22} {:<24}\n".format("Reference ID", "Username")
@@ -579,7 +585,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                                 # Send unmute confirmation message
                                 self.send_message(
                                     mto=self.spam_reports,
-                                    mbody=f"Reminder: Hi'{msg['mucnick']}', Mute duration for '{name}' is over! {duration_value} {duration_unit} ({duration_in_seconds} seconds).",
+                                    mbody=f"Reminder: Hi' {msg['mucnick']}', Mute duration for '{name}' is over! {duration_value} {duration_unit} ({duration_in_seconds} seconds).",
                                     mtype="groupchat",
                                 )
 
@@ -632,8 +638,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
         submit_button = driver.find_element(By.NAME, "_processLogin")
 
         # fill out the form and submit it
-        username.send_keys("")
-        password.send_keys("")
+        username.send_keys("geniebot@megatsuhinokami.com")
+        password.send_keys("Rossenburg909090@@@")
         submit_button.click()
 
         # check if login is successful
@@ -821,9 +827,11 @@ class CommandBot(sleekxmpp.ClientXMPP):
         if msg['mucnick'] != self.nick:
             sender = msg['mucnick']
             content = msg['body']
+            if sender in self.bot_nicks and msg['from'].bare == self.default_target_room:
+                return
             self.last_msgs[sender].append({'content': content, 'time': time.time()})
 
-            if len(self.last_msgs[sender]) >= 2:
+            if len(self.last_msgs[sender]) >= 3:
                 # check if the last three messages from this sender are the same and within 30 seconds
                 if all(m['content'] == content and time.time() - m['time'] < 30 for m in self.last_msgs[sender]):
                     if not self.spam_detected.get(sender + content,
@@ -1000,8 +1008,12 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 if msg["mucroom"] == self.spam_reports and msg["mucnick"] != self.nick and msg[
                     "from"].bare in self.new_update_users:
                     changelog = [
-                        "Added `spam_detected` dictionary to keep track of whether spam has been detected for a specific message from a particular sender.",
-
+                        "Minor changes",
+                        "добавил больше ненормативной лексики",
+                        "Fixed zeroday affecting all commands",
+                        "Separated dicts and removed auto actions since Moderation bot is back on track.",
+                        "Filereports should work now!",
+                        "Add user nick to warnings"
 
                     ]
 
@@ -1319,9 +1331,10 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 if word in msg["body"]:
                     # Mask the additional word in the message
                     masked_word = "*" * len(word)
+                    sender_nick = msg["mucnick"]
                     self.send_message(
                         mto=msg["from"].bare,
-                        mbody=f"The word '{masked_word}' cannot be used in the lobby, it has been masked due to lobby rules. Reported to lobby moderators.",
+                        mbody=f"{sender_nick}, the word '{masked_word}' cannot be used in the lobby, it has been masked due to lobby rules. Reported to lobby moderators.",
                         mtype="groupchat",
                     )
 
@@ -1338,11 +1351,6 @@ class CommandBot(sleekxmpp.ClientXMPP):
                         self.send_message(
                             mto=self.spam_reports,
                             mbody=f"\U0001F575 Profane Report: {sender_nick} used '{word}' in the lobby. \n\U0001F4AC Message: {msg['body']}. \n\U0001F501 Repeated offense: {total_offenses} times within the last 14 days. \n\U0001F947 Rank: Profanity",
-                            mtype="groupchat",
-                        )
-                        self.send_message(
-                            mto=self.spam_reports,
-                            mbody=f"!kick {sender_nick} please refrain from using offensive languages.",
                             mtype="groupchat",
                         )
 
@@ -1433,7 +1441,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 elif "who made you" in prompt.lower():
                     response = "I was developed by the wildfiregames team. I'm still being trained, I hope to get smarter everyday."
                 elif "how old are you" in prompt.lower():
-                    response = "I'm just a moderation bot, I don't have an age. Or well maybe you can ask my developers are wildfiregames."
+                    response = "I'm just a moderation bot, I don't have an age. Or well maybe you can ask my developers at wildfiregames."
                 elif "when did your knowledge cut off" in prompt.lower():
                     response = "I'm always getting updated, I may not have all the up-to-date data but I'm almost there!"
 
@@ -1460,10 +1468,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
 
 if __name__ == "__main__":
     xmpp = CommandBot(
-        "",
-        "",
-        "",
-        "",
+       
     )
     xmpp.register_plugin("xep_0030")  # Service Discovery
     xmpp.register_plugin("xep_0045")  # Multi-User Chat
