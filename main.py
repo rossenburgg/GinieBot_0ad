@@ -638,8 +638,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
         submit_button = driver.find_element(By.NAME, "_processLogin")
 
         # fill out the form and submit it
-        username.send_keys("geniebot@megatsuhinokami.com")
-        password.send_keys("Rossenburg909090@@@")
+        username.send_keys("")
+        password.send_keys("")
         submit_button.click()
 
         # check if login is successful
