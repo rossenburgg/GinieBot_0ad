@@ -10,7 +10,7 @@ import logging
 import os
 import ssl
 from collections import defaultdict
-from typing import Iterable, Sequence
+from typing import Iterable, Optional, Sequence
 
 import sleekxmpp
 from dotenv import load_dotenv
@@ -133,10 +133,29 @@ def _read_env_sequence(var_name: str) -> Iterable[str]:
     return tuple(room.strip() for room in value.split(",") if room.strip())
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def build_bot_from_env(logger: Optional[logging.Logger] = None) -> SimplePresenceBot:
+    """Construct a ``SimplePresenceBot`` using environment configuration.
 
-    # Allow overriding the .env path with XMPP_ENV_FILE; fall back to default search.
+    Parameters
+    ----------
+    logger:
+        Optional logger for reporting configuration issues. Falls back to the
+        module-level ``logging`` if not supplied.
+
+    Returns
+    -------
+    SimplePresenceBot
+        A bot instance configured with credentials and target rooms from
+        environment variables.
+
+    Raises
+    ------
+    ValueError
+        If any mandatory environment variables are missing.
+    """
+
+    active_logger = logger or logging.getLogger(__name__)
+
     env_file = os.getenv("XMPP_ENV_FILE")
     if env_file:
         load_dotenv(env_file, override=True)
@@ -158,8 +177,8 @@ def main() -> int:
     ]
     if missing:
         joined = ", ".join(missing)
-        logging.error("Missing required environment variables: %s", joined)
-        return 1
+        active_logger.error("Missing required environment variables: %s", joined)
+        raise ValueError(f"Missing required environment variables: {joined}")
 
     rooms = _read_env_sequence("XMPP_ROOMS") or DEFAULT_ROOMS
 
@@ -176,15 +195,37 @@ def main() -> int:
     bot.whitespace_keepalive = True
     bot.whitespace_keepalive_interval = 30
 
-    logging.info("Connecting as %s", jid)
-    if bot.connect():
-        logging.info("Connection established; entering processing loop")
-        bot.process(block=True)
-        logging.info("Disconnected cleanly")
-        return 0
+    return bot
 
-    logging.error("Unable to connect to XMPP server")
-    return 1
+
+def run_bot(bot: SimplePresenceBot, *, logger: Optional[logging.Logger] = None) -> int:
+    """Connect the provided bot and block until it disconnects."""
+
+    active_logger = logger or logging.getLogger(__name__)
+
+    active_logger.info("Connecting as %s", bot.boundjid.bare)
+    try:
+        if bot.connect():
+            active_logger.info("Connection established; entering processing loop")
+            bot.process(block=True)
+            active_logger.info("Disconnected cleanly")
+            return 0
+
+        active_logger.error("Unable to connect to XMPP server")
+        return 1
+    finally:
+        bot.disconnect(wait=False)
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    try:
+        bot = build_bot_from_env()
+    except ValueError:
+        return 1
+
+    return run_bot(bot)
 
 
 if __name__ == "__main__":

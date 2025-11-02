@@ -1,10 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: xmpp-bot
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python simple_bot/simple_bot.py
+    startCommand: uvicorn simple_bot.render_service:app --host 0.0.0.0 --port ${PORT:-10000}
     envVars:
       - key: XMPP_JID
         sync: false
@@ -16,3 +16,9 @@ services:
         sync: false
       - key: XMPP_ENV_FILE
         sync: false
+      - key: KEEPALIVE_URL
+        sync: false
+      - key: KEEPALIVE_INTERVAL
+        value: "600"
+      - key: BOT_RESTART_DELAY
+        value: "15"
