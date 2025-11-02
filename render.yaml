@@ -3,8 +3,8 @@ services:
     name: xmpp-bot
     env: python
     plan: free
-  buildCommand: PYTHONPATH=. pip install --no-build-isolation -r requirements.txt
-  startCommand: PYTHONPATH=.:$PYTHONPATH uvicorn simple_bot.render_service:app --host 0.0.0.0 --port ${PORT:-10000}
+    buildCommand: PYTHONPATH=. pip install --no-build-isolation -r requirements.txt
+    startCommand: PYTHONPATH=.:$PYTHONPATH uvicorn simple_bot.render_service:app --host 0.0.0.0 --port ${PORT:-10000}
     envVars:
       - key: XMPP_JID
         sync: false
