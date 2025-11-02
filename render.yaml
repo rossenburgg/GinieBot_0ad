@@ -16,6 +16,8 @@ services:
         sync: false
       - key: XMPP_ENV_FILE
         sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: KEEPALIVE_URL
         sync: false
       - key: KEEPALIVE_INTERVAL
