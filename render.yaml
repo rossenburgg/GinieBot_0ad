@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: xmpp-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python simple_bot/simple_bot.py
+    envVars:
+      - key: XMPP_JID
+        sync: false
+      - key: XMPP_PASSWORD
+        sync: false
+      - key: XMPP_NICKNAME
+        sync: false
+      - key: XMPP_ROOMS
+        sync: false
+      - key: XMPP_ENV_FILE
+        sync: false
