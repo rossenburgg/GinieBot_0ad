@@ -21,6 +21,8 @@ DEFAULT_ROOMS = (
     "arena26@conference.lobby.wildfiregames.com",
     "arena27@conference.lobby.wildfiregames.com",
     "helpers@conference.lobby.wildfiregames.com",
+    "arena28@conference.lobby.wildfiregames.com",
+
 )
 
 
