@@ -1,4 +1,5 @@
 import datetime
+import asyncio
 import logging
 import os
 import random
@@ -1752,7 +1753,8 @@ if __name__ == "__main__":
     xmpp.keepalive = True
     xmpp.debug = True
 
-    if xmpp.connect():
-        xmpp.process()
-    else:
-        print("Unable to connect.")
+    # slixmpp is asyncio-native: connect() schedules the connection and the
+    # event loop runs it. Connection failures surface through slixmpp's
+    # 'connection_failed' / 'failed_all_auth' events in the log output.
+    xmpp.connect()
+    asyncio.get_event_loop().run_forever()

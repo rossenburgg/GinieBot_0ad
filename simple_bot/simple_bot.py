@@ -6,6 +6,7 @@ as a stripped-down alternative to the full-featured GinieBot found in
 ``main.py``.
 """
 
+import asyncio
 import logging
 import os
 import ssl
@@ -207,14 +208,17 @@ def run_bot(bot: SimplePresenceBot, *, logger: Optional[logging.Logger] = None) 
 
     active_logger.info("Connecting as %s", bot.boundjid.bare)
     try:
-        if bot.connect():
-            active_logger.info("Connection established; entering processing loop")
-            bot.process(block=True)
-            active_logger.info("Disconnected cleanly")
-            return 0
-
-        active_logger.error("Unable to connect to XMPP server")
-        return 1
+        # slixmpp is asyncio-native: connect() schedules the connection and
+        # the event loop runs it. Failures surface through slixmpp's
+        # 'connection_failed' / 'failed_all_auth' events in the log output.
+        bot.connect()
+        active_logger.info("Connection initiated; entering event loop")
+        asyncio.get_event_loop().run_forever()
+        active_logger.info("Disconnected cleanly")
+        return 0
+    except KeyboardInterrupt:
+        active_logger.info("Interrupted by user")
+        return 0
     finally:
         bot.disconnect(wait=False)
 
