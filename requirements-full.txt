@@ -1,0 +1,10 @@
+# Full GinieBot (main.py) dependencies.
+# sleekxmpp is vendored in ./sleekxmpp, so it is not listed here.
+# All of these are optional: the bot starts without them and the
+# features that need them degrade gracefully.
+python-dotenv>=1.0.0
+wikipedia>=1.4.0
+nltk>=3.8
+plotly>=5.0.0
+selenium>=4.0.0
+openai>=1.0.0

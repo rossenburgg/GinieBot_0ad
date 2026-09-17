@@ -1,9 +1,44 @@
 # GinieBot_0ad
 
-This repository now contains two XMPP bots:
+XMPP bots for the Wildfire Games (0 A.D.) lobby.
 
-- `main.py`: the legacy, feature-rich GinieBot with moderation, analytics, and integrations.
+- `main.py`: the full-featured GinieBot with moderation, spam detection, watch lists, player reports, mute, Wikipedia lookup, AI replies, analytics charts, and forum posting.
 - `simple_bot/simple_bot.py`: a stripped-down helper that only joins a few lobby rooms and keeps its presence set to away.
+
+## Full bot
+
+### Prerequisites
+
+- Python 3.10+
+- `sleekxmpp` is vendored in this repo, no install needed.
+
+### Required environment variables
+
+- `XMPP_JID`: Full JID of the bot account (for example, `bot@lobby.wildfiregames.com`).
+- `XMPP_PASSWORD`: Password for the account.
+
+Optional:
+
+- `XMPP_NICKNAME`: Nickname inside rooms (default: `GinieBot`).
+- `XMPP_ROOM`: Primary room to monitor (default: `arena26@conference.lobby.wildfiregames.com`).
+- `XMPP_SPAM_REPORTS`: Room JID where reports and alerts go.
+- `XMPP_DEFAULT_TARGET_ROOM`, `XMPP_ARENA25`, `XMPP_ARENA27`: Override room JIDs.
+- `OPENAI_API_KEY`: Enables AI replies (needs `openai` package).
+- `FORUM_USER` / `FORUM_PASS`: Forum credentials for the analytics push command (needs `selenium` package).
+
+Extra features degrade gracefully: without `wikipedia`/`nltk` there is no wiki lookup, without `openai` no AI replies, without `selenium` no forum posting, without `plotly` no charts. Install what you want from `requirements-full.txt`.
+
+### Run it
+
+```bash
+cp .env.example .env  # edit the copy with your credentials
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-full.txt
+PYTHONPATH=. python main.py
+```
+
+`PYTHONPATH=.` is required so the vendored `sleekxmpp` package is found.
 
 ## Simple presence bot
 
@@ -34,8 +69,10 @@ cp .env.example .env  # edit the copy with your credentials
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r simple_bot/requirements.txt
-python simple_bot/simple_bot.py
+PYTHONPATH=. python simple_bot/simple_bot.py
 ```
+
+`PYTHONPATH=.` is required so the vendored `sleekxmpp` package is found. (Running the script path directly without it fails with `ModuleNotFoundError: No module named 'sleekxmpp'`.)
 
 The script keeps running until interrupted, reconnecting automatically when the connection drops.
 
