@@ -1720,6 +1720,15 @@ if __name__ == "__main__":
     if missing:
         raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
 
+    resource = jid.rsplit("/", 1)[1] if "/" in jid else ""
+    if not resource.startswith("0ad"):
+        print(
+            "WARNING: XMPP resource does not start with '0ad'; the lobby server "
+            "will ignore rating lookups. Use a JID like "
+            "bot@lobby.wildfiregames.com/0adbot to enable the rating command. "
+            "Note: the server then tracks the bot as a leaderboard player."
+        )
+
     xmpp = CommandBot(
         jid,
         password,
