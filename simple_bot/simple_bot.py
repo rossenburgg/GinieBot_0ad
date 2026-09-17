@@ -12,7 +12,7 @@ import ssl
 from collections import defaultdict
 from typing import Iterable, Optional, Sequence
 
-import sleekxmpp
+import slixmpp
 from dotenv import load_dotenv
 
 # Default conference rooms to join.
@@ -26,7 +26,7 @@ DEFAULT_ROOMS = (
 )
 
 
-class SimplePresenceBot(sleekxmpp.ClientXMPP):
+class SimplePresenceBot(slixmpp.ClientXMPP):
     """A bare-bones XMPP client that only joins rooms and stays away."""
 
     def __init__(self, jid: str, password: str, nickname: str, rooms: Sequence[str]):
@@ -93,7 +93,7 @@ class SimplePresenceBot(sleekxmpp.ClientXMPP):
         self.room_join_attempts[room] += 1
 
         muc = self.plugin["xep_0045"]
-        muc.joinMUC(room, self.nickname, wait=True)
+        muc.join_muc_wait(room, self.nickname)
         self.send_presence(pshow="away", pstatus="Monitoring lobby", pto=room)
         self.schedule(f"verify-{room}", 3, self._verify_membership, kwargs={"room": room})
 
@@ -118,7 +118,7 @@ class SimplePresenceBot(sleekxmpp.ClientXMPP):
                 self._handle_room_presence,
             )
             logging.info("Attempting join for %s using nick '%s'", room, self.nickname)
-            muc.joinMUC(room, self.nickname, wait=True)
+            muc.join_muc_wait(room, self.nickname)
             # Ensure our presence inside each room stays away as well.
             self.send_presence(pshow="away", pstatus="Monitoring lobby", pto=room)
 

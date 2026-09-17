@@ -9,8 +9,9 @@ import time
 import uuid
 from collections import defaultdict, deque
 
-import sleekxmpp
-from sleekxmpp import Message
+import slixmpp
+from slixmpp import Iq, Message
+from slixmpp.xmlstream import ET, ElementBase, register_stanza_plugin
 
 # Optional heavy dependencies are imported lazily so the core bot
 # (moderation, spam detection, reports) starts without them installed.
@@ -49,6 +50,8 @@ try:
 except ImportError:  # pragma: no cover
     OpenAI = None
 
+from geniebot_store import GenieBotStore
+
 
 def _ensure_nltk_punkt():
     """Download the NLTK punkt tokenizer on first use, never at import."""
@@ -68,6 +71,36 @@ def _ensure_nltk_punkt():
 logging.basicConfig(level=logging.INFO)
 
 
+# ---------------------------------------------------------------------------
+# 0 A.D. lobby ratings lookup
+# ---------------------------------------------------------------------------
+# The lobby server (xpartamupp) answers player-profile queries over XMPP: an
+# <iq type='get'> with a <query xmlns='jabber:iq:profile'/> payload holding
+# <command>{player_nick}</command>. The reply carries a <profile/> element
+# with rating, highestRating, rank, totalGamesPlayed, wins, and losses.
+# NOTE: the server only answers clients whose resource starts with "0ad"
+# (like the game client). To enable the rating command, connect with a JID
+# such as bot@lobby.wildfiregames.com/0adbot. The server will then track the
+# bot as a player in its leaderboard database; that is the operator's call.
+RATINGS_IQ_TIMEOUT = 10
+
+
+class ProfileQuery(ElementBase):
+    """Minimal jabber:iq:profile stanza for ratings lookups."""
+
+    name = "query"
+    namespace = "jabber:iq:profile"
+    interfaces = {"command"}
+    sub_interfaces = interfaces
+    plugin_attrib = "profile"
+
+    def add_command(self, player_nick):
+        self.xml.append(ET.fromstring("<command>%s</command>" % player_nick))
+
+
+register_stanza_plugin(Iq, ProfileQuery)
+
+
 # The name of the MUC room to monitor
 MUC_ROOM = 'arena26@conference.lobby.wildfiregames.com'
 
@@ -81,7 +114,87 @@ def detect_spam(msg):
     return False
 
 
-class CommandBot(sleekxmpp.ClientXMPP):
+# ---------------------------------------------------------------------------
+# Smarter spam detection
+# ---------------------------------------------------------------------------
+# A user trips the rate limiter by sending more than SPAM_RATE_LIMIT_COUNT
+# messages inside SPAM_RATE_LIMIT_WINDOW seconds.
+SPAM_RATE_LIMIT_COUNT = 6
+SPAM_RATE_LIMIT_WINDOW = 10
+# A message trips the caps check when it is longer than SPAM_CAPS_MIN_LENGTH
+# characters and more than SPAM_CAPS_RATIO of its letters are uppercase.
+SPAM_CAPS_MIN_LENGTH = 12
+SPAM_CAPS_RATIO = 0.70
+# A message trips the link check with more than SPAM_LINK_COUNT URLs in it,
+# or when the same URL appears SPAM_LINK_REPEAT times across recent messages.
+SPAM_LINK_COUNT = 2
+SPAM_LINK_REPEAT = 3
+# At most one spam alert per user per cooldown window, to avoid alert floods.
+SPAM_ALERT_COOLDOWN = 300
+
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def is_caps_spam(text):
+    """True when a long message is mostly uppercase shouting."""
+    letters = [c for c in text if c.isalpha()]
+    if len(text) < SPAM_CAPS_MIN_LENGTH or not letters:
+        return False
+    return sum(1 for c in letters if c.isupper()) / len(letters) > SPAM_CAPS_RATIO
+
+
+class SpamTracker:
+    """Per-user rolling spam state: rate, caps, and link checks.
+
+    ``record(sender, text, now=None)`` registers one message and returns a
+    list of triggered reason strings (empty when the message is clean).
+    """
+
+    def __init__(self):
+        self._times = defaultdict(deque)  # sender -> deque[timestamps]
+        self._urls = defaultdict(deque)   # sender -> deque[(timestamp, url)]
+
+    def _prune(self, sender, now):
+        cutoff = now - SPAM_RATE_LIMIT_WINDOW
+        times = self._times[sender]
+        while times and times[0] < cutoff:
+            times.popleft()
+        urls = self._urls[sender]
+        while urls and urls[0][0] < cutoff:
+            urls.popleft()
+
+    def record(self, sender, text, now=None):
+        now = time.time() if now is None else now
+        reasons = []
+        self._prune(sender, now)
+
+        # Rate limit: too many messages inside the window.
+        self._times[sender].append(now)
+        if len(self._times[sender]) > SPAM_RATE_LIMIT_COUNT:
+            reasons.append(
+                "rate limit (%d msgs / %ds)"
+                % (len(self._times[sender]), SPAM_RATE_LIMIT_WINDOW)
+            )
+
+        # Caps shouting.
+        if is_caps_spam(text):
+            reasons.append("caps shouting")
+
+        # Link spam: many URLs in one message, or one URL repeated.
+        urls = URL_RE.findall(text)
+        for url in urls:
+            self._urls[sender].append((now, url.lower()))
+        if len(urls) > SPAM_LINK_COUNT:
+            reasons.append("link spam (%d urls)" % len(urls))
+        elif urls:
+            recent = [u for _, u in self._urls[sender]]
+            if max(recent.count(u) for u in set(urls)) >= SPAM_LINK_REPEAT:
+                reasons.append("repeated link")
+
+        return reasons
+
+
+class CommandBot(slixmpp.ClientXMPP):
     def __init__(
             self,
             jid,
@@ -94,7 +207,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
             arena27="arena27@conference.lobby.wildfiregames.com"
 
     ):
-        sleekxmpp.ClientXMPP.__init__(self, jid, password)
+        slixmpp.ClientXMPP.__init__(self, jid, password)
 
         self.users_announced = {}
         self.offenders = {}
@@ -117,7 +230,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
 
         self.add_event_handler("session_start", self.start)
         self.add_event_handler("groupchat_message", self.message)
-        self.add_event_handler("message", self.watch_user, threaded=True)
+        self.add_event_handler("message", self.watch_user)
         self.add_event_handler('presence', self.on_presence)
         self.add_event_handler("message", self.list_commands)
         self.add_event_handler("message", self.handle_reports)
@@ -125,6 +238,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.add_event_handler("message", self.handle_mute)
         self.add_event_handler("message", self.handle_private_message)
         self.last_msgs = defaultdict(lambda: deque(maxlen=3))
+        self.spam_tracker = SpamTracker()
+        self._spam_alert_at = {}
         self.quiet_end = 0  # the time at which the bot will stop being quiet
         threading.Thread(target=self.check_quiet_period, daemon=True).start()
         self.spam_detected = {}
@@ -166,6 +281,81 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.reports_history = []
         self.reportsHelper = {}
 
+        # Persistent moderation state (SQLite). Falls back to in-memory
+        # storage if the database file cannot be opened.
+        self.store = GenieBotStore()
+        self._load_persistent_state()
+
+    def _load_persistent_state(self):
+        """Restore reports, watchlist, and recent offenders from SQLite."""
+        try:
+            for row in self.store.list_reports():
+                self.reportsHelper[row["id"]] = {
+                    "username": row["reported_user"],
+                    "sender": row["reporter"],
+                }
+            for row in self.store.list_watch():
+                if row["nick"] not in self.users_to_watch:
+                    self.users_to_watch.append(row["nick"])
+            now = datetime.datetime.now(datetime.timezone.utc)
+            cutoff = now - datetime.timedelta(days=14)
+            for row in self.store.list_offenders():
+                try:
+                    last = (datetime.datetime.fromisoformat(row["last_offense_at"])
+                            if row["last_offense_at"] else None)
+                except (ValueError, TypeError):
+                    last = None
+                if last is None:
+                    continue
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=datetime.timezone.utc)
+                if last >= cutoff:
+                    # Keep the in-memory shape the rest of the bot expects
+                    # (naive datetimes, as produced by datetime.now()).
+                    self.user_offenses[row["nick"]] = {
+                        "offense_timestamps": [last.replace(tzinfo=None)],
+                        "total_offenses": row["offenses"],
+                    }
+        except Exception:
+            logging.exception("Failed to load persistent bot state")
+
+    def _spam_alert_allowed(self, sender):
+        """Allow at most one spam alert per sender per SPAM_ALERT_COOLDOWN."""
+        now = time.time()
+        last = self._spam_alert_at.get(sender, 0)
+        if now - last < SPAM_ALERT_COOLDOWN:
+            return False
+        self._spam_alert_at[sender] = now
+        return True
+
+    def lookup_rating(self, player_nick):
+        """Fetch a player's lobby rating via an XMPP profile query.
+
+        Returns a dict with rating/highestRating/rank/totalGamesPlayed/
+        wins/losses, or None when the lookup fails or times out.
+        """
+        try:
+            iq = self.make_iq_get(ito=self.boundjid.host)
+            query = ProfileQuery()
+            query.add_command(player_nick)
+            iq.set_payload(query)
+            resp = iq.send(timeout=RATINGS_IQ_TIMEOUT)
+        except Exception as exc:
+            logging.warning("Rating lookup for %s failed: %s", player_nick, exc)
+            return None
+        ns = "{jabber:iq:profile}"
+        for elem in resp.xml.iter(ns + "profile"):
+            return {
+                "player": elem.get("player", player_nick),
+                "rating": elem.get("rating", "?"),
+                "highestRating": elem.get("highestRating", "?"),
+                "rank": elem.get("rank", "?"),
+                "totalGamesPlayed": elem.get("totalGamesPlayed", "?"),
+                "wins": elem.get("wins", "?"),
+                "losses": elem.get("losses", "?"),
+            }
+        return None
+
     def command_match(self, msg):
 
         # Return True if the message is a command that the bot should handle
@@ -186,7 +376,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
         for r in [self.room, self.spam_reports, self.arena25, self.arena27]:
             if not r:
                 continue
-            self.plugin["xep_0045"].joinMUC(r, self.nick, wait=True)
+            self.plugin["xep_0045"].join_muc_wait(r, self.nick)
             self.send_presence(pshow='away', pstatus="Undergoing realtime update", pto=r)
             # Print the watch list
             print("Watch list:", self.users_to_watch)
@@ -250,10 +440,11 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 if len(words) >= 3:
                     username = words[2]
                     # Check if the user is present in the default room or if it's a forcewatch command
-                    if username in self.plugin['xep_0045'].getRoster(self.default_target_room) or words[
+                    if username in self.plugin['xep_0045'].get_roster(self.default_target_room) or words[
                         1] == 'forcewatch':
                         if username != bot_name and username not in self.users_to_watch:
                             self.users_to_watch.append(username)
+                            self.store.add_watch(username, added_by=msg["mucnick"])
                             message = f"{username} has been added to the watch list"
                         elif username == bot_name:
                             message = f"{bot_name} cannot be added to the watch list"
@@ -278,6 +469,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     username = words[2]
                     if username in self.users_to_watch:
                         self.users_to_watch.remove(username)
+                        self.store.remove_watch(username)
                         message = f"{username} has been removed from the watch list"
                     else:
                         message = f"{username} is not in the watch list"
@@ -292,6 +484,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     # Force add the user to the watch list
                     if username != bot_name and username not in self.users_to_watch:
                         self.users_to_watch.append(username)
+                        self.store.add_watch(username, added_by=msg["mucnick"], force=True)
                         message = f"{username} has been force-added to the watch list"
                     elif username == bot_name:
                         message = f"{bot_name} cannot be added to the watch list"
@@ -313,6 +506,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     f"{bot_name} listwatch: list all the users currently being watched",
                     f"{bot_name} commands: display all available commands",
                     f"{bot_name} offenders: display the number of offenders",
+                    f"{bot_name} rating <player>: look up a player's lobby rating",
                     f"{bot_name} filereport username: File a report for a player",
                     f"{bot_name} listreports : Show all reports",
                     f"{bot_name} push-analytics : Publish moderation report to the wildfiregames forums (Use only at the beginning of every month)",
@@ -414,11 +608,18 @@ class CommandBot(sleekxmpp.ClientXMPP):
         # Clear the dictionary if it's been more than 14 days since the last offense
         if not recent_offenses and offense_timestamps:
             self.user_offenses[sender_nick] = {}
+            self.store.record_offense(sender_nick, 0)
         else:
+            new_total = (total_offenses - len(offense_timestamps)
+                         + len(recent_offenses))
             self.user_offenses[sender_nick] = {
                 "offense_timestamps": recent_offenses,
-                "total_offenses": total_offenses - len(offense_timestamps) + len(recent_offenses)
+                "total_offenses": new_total
             }
+            if recent_offenses:
+                self.store.record_offense(
+                    sender_nick, new_total,
+                    last_offense_at=max(recent_offenses).isoformat())
         return self.user_offenses[sender_nick].get("total_offenses", 0)
 
     def get_offenders(self):
@@ -454,7 +655,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 username = body.split(" ")[-1]
 
                 # Check if the user we are sending the report to is online
-                if username not in self.plugin['xep_0045'].getRoster(self.default_target_room):
+                if username not in self.plugin['xep_0045'].get_roster(self.default_target_room):
                     self.send_message(
                         mto=self.spam_reports,
                         mbody=f"{username} is not online and the report could not be filed.",
@@ -470,6 +671,8 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 link = short_url
                 # Store the report and its ID in the reports dictionary
                 self.reportsHelper[report_id] = {"username": username, "sender": sender_nick}
+                self.store.add_report(report_id, sender_nick, username,
+                                      room=self.spam_reports)
                 # Send the message with the link and reference ID
                 output = f"Hi {username}, I apologize for the inconvenience caused by the player who left a 1v1 game without resigning. To address this issue, please report the incident and tag user1 using the reference ID below at:\n{link}\n\n"
                 output += "{:<22} {:<24}\n".format("Reference ID", "Username")
@@ -719,7 +922,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
         self.update_chart()
 
     def get_users_online(self):
-        roster = self.plugin["xep_0045"].getRoster(self.default_target_room)
+        roster = self.plugin["xep_0045"].get_roster(self.default_target_room)
         if roster is not None:
             return len(roster)
         return 0
@@ -841,6 +1044,15 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 else:
                     self.spam_detected[
                         sender + content] = False  # if the messages are not the same, reset the spam_detected flag
+
+            # Smarter spam checks: rate limiting, caps shouting, link spam.
+            reasons = self.spam_tracker.record(sender, content)
+            if reasons and self._spam_alert_allowed(sender):
+                self.send_message(
+                    mto=self.spam_reports,
+                    mbody=f"Spam alert for '{sender}': {', '.join(reasons)}",
+                    mtype="groupchat",
+                )
         if msg['mucnick'] != self.nick:
             if self.quiet_end and time.time() < self.quiet_end and msg['from'].bare == self.default_target_room:
                 # if the bot is in quiet mode and the message is from the target room, don't process the message
@@ -901,7 +1113,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
 
             output += "-" * 56 + "\n"
 
-            for report_id, report_data in self.reports.items():
+            for report_id, report_data in self.reportsHelper.items():
                 output += "{:<15} {:<25} {:<10}\n".format(report_id, report_data["username"], report_data["sender"])
 
             print(f"DEBUG: Outputting report list:\n{output}")
@@ -940,6 +1152,35 @@ class CommandBot(sleekxmpp.ClientXMPP):
                     mbody=output,
                     mtype="groupchat",
                 )
+
+        # Ratings lookup: "{nick} rating <player>"
+        if msg["body"].lower().startswith(self.nick.lower() + " rating"):
+            words = msg["body"].split()
+            if len(words) < 3:
+                self.send_message(
+                    mto=msg["from"].bare,
+                    mbody=f"Usage: {self.nick} rating <player>",
+                    mtype="groupchat",
+                )
+            else:
+                player = words[2]
+                stats = self.lookup_rating(player)
+                if stats:
+                    self.send_message(
+                        mto=msg["from"].bare,
+                        mbody=(f"{stats['player']}: rating {stats['rating']} "
+                               f"(highest {stats['highestRating']}, rank {stats['rank']}, "
+                               f"{stats['totalGamesPlayed']} games: "
+                               f"{stats['wins']}W/{stats['losses']}L)"),
+                        mtype="groupchat",
+                    )
+                else:
+                    self.send_message(
+                        mto=msg["from"].bare,
+                        mbody=f"Couldn't fetch a rating for '{player}'. "
+                              f"Ratings are currently unavailable.",
+                        mtype="groupchat",
+                    )
 
         # Check if the message is a Wikipedia search command
         if msg["body"].startswith("!wiki"):
@@ -1078,7 +1319,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
             return True
         elif msg["body"] == "!users" and msg["mucnick"]:
             # Get the list of users in the MUC room
-            users = self.plugin["xep_0045"].getRoster(self.room)
+            users = self.plugin["xep_0045"].get_roster(self.room)
 
             # Get the number of users in the MUC room
             num_users = len(users)
@@ -1250,6 +1491,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                 user_offenses["total_offenses"] = total_offenses
                 user_offenses["rank"] = "Pejorative"
                 self.user_offenses[sender_nick] = user_offenses
+                self.store.record_offense(sender_nick, total_offenses)
 
                 # Check if the user has been warned within the cooldown period
                 last_warning_time = self.last_warnings.get(sender_nick)
@@ -1340,6 +1582,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
                         user_offenses["total_offenses"] = total_offenses
                         user_offenses["rank"] = "Profanity"
                         self.user_offenses[sender_nick] = user_offenses
+                        self.store.record_offense(sender_nick, total_offenses)
 
                         # Send a report to the spam_reports groupchat
                         user_total_offenses = self.get_user_total_offenses(sender_nick)
@@ -1457,7 +1700,7 @@ class CommandBot(sleekxmpp.ClientXMPP):
 
     # This method is called to join a chat room
     def join_room(self, room_jid):
-        self.plugin["xep_0045"].joinMUC(room_jid, self.nick, wait=True, )
+        self.plugin["xep_0045"].join_muc_wait(room_jid, self.nick)
         self.rooms.append(room_jid)
 
 

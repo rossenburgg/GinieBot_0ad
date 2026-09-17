@@ -1,8 +1,9 @@
 # Full GinieBot (main.py) dependencies.
-# sleekxmpp is vendored in ./sleekxmpp, so it is not listed here.
+# slixmpp is the maintained fork of sleekxmpp (asyncio-based, Python 3.11+).
 # All of these are optional: the bot starts without them and the
 # features that need them degrade gracefully.
 python-dotenv>=1.0.0
+slixmpp>=1.8.0
 wikipedia>=1.4.0
 nltk>=3.8
 plotly>=5.0.0

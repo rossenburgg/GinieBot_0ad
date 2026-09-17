@@ -3,6 +3,12 @@
 .env.*
 *.env
 
+# SQLite databases (runtime state, never committed)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Python caches
 __pycache__/
 *.py[cod]

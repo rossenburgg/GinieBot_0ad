@@ -8,18 +8,24 @@ keep-alive requests will hit the exposed HTTP endpoint.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from simple_bot.simple_bot import SimplePresenceBot, build_bot_from_env, run_bot
+
+# The admin dashboard reads the same SQLite database the full bot writes to.
+# geniebot_store.py lives in the repository root, one level above this file.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 LOGGER = logging.getLogger("render_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -211,3 +217,141 @@ def root_status() -> Dict[str, Any]:
         "restart_count": supervisor.state.get("restart_count", 0),
         "last_error": supervisor.state.get("last_error"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard (token-protected)
+# ---------------------------------------------------------------------------
+# Set ADMIN_TOKEN in the environment to enable these endpoints. Every request
+# must carry the token either as ?token=<token> or as an
+# Authorization: Bearer <token> header. Without a configured ADMIN_TOKEN the
+# endpoints stay disabled instead of being left open.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+
+def _open_store():
+    """Open the shared SQLite database the full bot writes to."""
+    try:
+        from geniebot_store import GenieBotStore
+    except ImportError as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=503, detail="Moderation database module unavailable") from exc
+    try:
+        return GenieBotStore()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=503, detail=f"Could not open moderation database: {exc}") from exc
+
+
+def require_admin_token(request: Request, token: Optional[str] = Query(default=None)) -> bool:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Admin dashboard is disabled (ADMIN_TOKEN is not set)")
+    provided = (token or "").strip()
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        provided = provided or auth[7:].strip()
+    if not provided or not hmac.compare_digest(provided, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid or missing admin token")
+    return True
+
+
+def _rows_to_dicts(rows):
+    return [dict(row) for row in rows]
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(authorized: bool = Depends(require_admin_token)) -> str:
+    """Serve a small self-contained dashboard page (token stays in the URL)."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GinieBot admin</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+h1 { font-size: 1.4rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.85rem; }
+th { background: #f4f4f4; }
+section { margin-top: 2rem; }
+#stats { font-size: 0.9rem; color: #444; }
+.error { color: #a00; }
+</style>
+</head>
+<body>
+<h1>GinieBot moderation admin</h1>
+<p id="stats">Loading…</p>
+<section><h2>Reports</h2><div id="reports">Loading…</div></section>
+<section><h2>Offenders</h2><div id="offenders">Loading…</div></section>
+<section><h2>Watchlist</h2><div id="watchlist">Loading…</div></section>
+<script>
+const token = new URLSearchParams(location.search).get("token") || "";
+const api = (path) => fetch(path + "?token=" + encodeURIComponent(token)).then(r => {
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+});
+function table(el, rows) {
+  if (!rows.length) { el.textContent = "None."; return; }
+  const cols = Object.keys(rows[0]);
+  el.innerHTML = "<table><thead><tr>" + cols.map(c => "<th>" + c + "</th>").join("") +
+    "</tr></thead><tbody>" + rows.map(r => "<tr>" + cols.map(c =>
+      "<td>" + (r[c] == null ? "" : String(r[c]).replace(/</g, "&lt;")) + "</td>").join("") +
+    "</tr>").join("") + "</tbody></table>";
+}
+function fail(el, err) { el.innerHTML = '<span class="error">' + err.message + "</span>"; }
+Promise.all([api("/admin/api/stats"), api("/admin/api/reports"),
+             api("/admin/api/offenders"), api("/admin/api/watchlist")])
+  .then(([stats, reports, offenders, watchlist]) => {
+    document.getElementById("stats").textContent =
+      "Reports: " + stats.reports + " | Offenders: " + stats.offenders +
+      " | Watched: " + stats.watchlist + " | DB: " + stats.db;
+    table(document.getElementById("reports"), reports);
+    table(document.getElementById("offenders"), offenders);
+    table(document.getElementById("watchlist"), watchlist);
+  })
+  .catch(err => { document.getElementById("stats").innerHTML =
+    '<span class="error">Failed to load: ' + err.message + "</span>"; });
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/api/stats")
+def admin_stats(authorized: bool = Depends(require_admin_token)) -> Dict[str, Any]:
+    store = _open_store()
+    try:
+        return {
+            "reports": len(store.list_reports()),
+            "offenders": len(store.list_offenders()),
+            "watchlist": len(store.list_watch()),
+            "db": store.path,
+        }
+    finally:
+        store.close()
+
+
+@app.get("/admin/api/reports")
+def admin_reports(authorized: bool = Depends(require_admin_token)):
+    store = _open_store()
+    try:
+        return _rows_to_dicts(store.list_reports())
+    finally:
+        store.close()
+
+
+@app.get("/admin/api/offenders")
+def admin_offenders(authorized: bool = Depends(require_admin_token)):
+    store = _open_store()
+    try:
+        return _rows_to_dicts(store.list_offenders())
+    finally:
+        store.close()
+
+
+@app.get("/admin/api/watchlist")
+def admin_watchlist(authorized: bool = Depends(require_admin_token)):
+    store = _open_store()
+    try:
+        return _rows_to_dicts(store.list_watch())
+    finally:
+        store.close()
